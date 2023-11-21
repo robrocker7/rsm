@@ -2,6 +2,10 @@
 
 A simple Secret Mangager for JSON payloads using SQLite3 and AES-256 encryption.
 
+## Installation
+
+`git clone --depth=1 https://github.com/robrocker7/rsm && cd rsm && cargo install --path .`
+
 ## Environment Variables
 
 The `RMS_KEY` and `RMS_IV` environment variables are required to be set.
