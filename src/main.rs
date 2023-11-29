@@ -63,29 +63,10 @@ fn decrypt(encrypted_data: &[u8], key: &[u8], iv: &[u8]) -> Result<String, symme
 fn put_secret(conn: &Connection, secret_name: &str, secret_data_json: &str, key: &[u8], iv: &[u8]) -> Result<()> {
     let encrypted_data = encrypt(secret_data_json, key, iv).expect("Encryption failed");
 
-    let insert_result = conn.execute(
-        "INSERT INTO secrets (name, data) VALUES (?1, ?2)",
+    let _insert_result = conn.execute(
+        "INSERT OR REPLACE INTO secrets (name, data) VALUES (?1, ?2)",
         params![secret_name, encrypted_data],
     );
-
-    if let Err(rusqlite::Error::SqliteFailure(err, _)) = insert_result {
-        if err.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE {
-            // Delete the existing record
-            conn.execute("DELETE FROM secrets WHERE name = ?1", params![secret_name])?;
-
-            // Try inserting again
-            conn.execute(
-                "INSERT INTO secrets (name, data) VALUES (?1, ?2)",
-                params![secret_name, encrypted_data],
-            )?;
-
-        } else {
-            // If the error is not due to a primary key constraint, re-raise it
-            return Err(insert_result.unwrap_err());
-        }
-    }
-
-
     Ok(())
 }
 
@@ -103,6 +84,7 @@ fn get_secret(conn: &Connection, secret_name: &str, key: &[u8], iv: &[u8]) -> Re
     }
 }
 
+// Exports all secrets in the db
 fn export(conn: &Connection, key: &[u8], iv: &[u8]) -> Result<Vec<Value>> {
     let mut stmt = conn.prepare("SELECT name, data FROM secrets")?;
     let rows = stmt.query_map([], |row| {
@@ -128,11 +110,37 @@ fn export(conn: &Connection, key: &[u8], iv: &[u8]) -> Result<Vec<Value>> {
     Ok(secrets)
 }
 
+// Imports a list of secrets from the format the export uses
+fn import(conn: &Connection, secrest_json_string: &str, key: &[u8], iv: &[u8]) -> Result<Vec<Value>> {
+    let mut responses = Vec::new();
+    let json: serde_json::Value = serde_json::from_str(&secrest_json_string).expect("JSON was not well-formatted");
+    if let Some(secrets) = json.as_array() {
+        for secret in secrets {
+            let name = &secret["name"].as_str().unwrap();
+            match &secret["data"] {
+                Value::Object(_) => {
+                    match put_secret(conn, name, &secret["data"].to_string(), key, iv) {
+                        Ok(_) => responses.push(serde_json::json!({"success": name})),
+                        Err(_)=> responses.push(serde_json::json!({"error": name})),
+                    }
+                },
+                Value::String(_) => {
+                    let data = secret["data"].as_str().unwrap();
+                    match put_secret(conn, name, data, key, iv) {
+                        Ok(_) => responses.push(serde_json::json!({"success": name})),
+                        Err(_)=> responses.push(serde_json::json!({"error": name})),
+                    }
+                }
+                _ => println!("It's another type"),
+            }
+        }
+    }
+    
+    Ok(responses)
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
-    // Your encryption key and IV (must be securely generated and managed)
     let key = env::var("RSM_KEY").unwrap().into_bytes();
-    //let key = b"1234567890ABCDEF1234567890ABCDEF"; // 32 bytes for AES-256
-    //let iv = b"1234567890ABCDEF"; // 16 bytes for AES
     let iv = env::var("RSM_IV").unwrap().into_bytes();
 
     let matches = App::new("Secrets Manager")
@@ -157,37 +165,51 @@ fn main() -> Result<(), Box<dyn Error>> {
                 .index(1)))
         .subcommand(SubCommand::with_name("export")
             .about("Exports all secrets to JSON"))
+        .subcommand(SubCommand::with_name("import")
+            .about("Retrieves a secret")
+            .arg(Arg::with_name("data")
+                .help("The json data of the secrets")
+                .required(true)
+                .index(1)))
         .get_matches();
     let mut path = env::current_exe()?;
     path.pop();
     path.push("secrets.db");
-    let conn = Connection::open(path)?;
+    {
+        let conn = Connection::open(path)?;
 
-    // Create the table for storing secrets
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS secrets (
-            id INTEGER PRIMARY KEY,
-            name TEXT NOT NULL UNIQUE,
-            data BLOB NOT NULL
-        )",
-        [],
-    )?;
+        // Create the table for storing secrets
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS secrets (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                data BLOB NOT NULL
+            )",
+            [],
+        )?;
 
-    if let Some(matches) = matches.subcommand_matches("put") {
-        let name = matches.value_of("name").unwrap();
-        let value = matches.value_of("value").unwrap();
-        put_secret(&conn, name, value, &key, &iv)?;
-        println!("{{\"success\":\"{}\"}}", name);
-    } else if let Some(matches) = matches.subcommand_matches("get") {
-        let name = matches.value_of("name").unwrap();
-        match get_secret(&conn, name, &key, &iv) {
-            Ok(secret) => println!("{}", secret),
-            Err(e) => println!("Error retrieving secret: {:?}", e),
-        }
-    } else if let Some(_matches) = matches.subcommand_matches("export") { 
-         match export(&conn, &key, &iv) {
-            Ok(secrets) => println!("{}", serde_json::json!(secrets).to_string()),
-            Err(e) => println!("Error retrieving secret: {:?}", e),
+        if let Some(matches) = matches.subcommand_matches("put") {
+            let name = matches.value_of("name").unwrap();
+            let value = matches.value_of("value").unwrap();
+            put_secret(&conn, name, value, &key, &iv)?;
+            println!("{{\"success\":\"{}\"}}", name);
+        } else if let Some(matches) = matches.subcommand_matches("get") {
+            let name = matches.value_of("name").unwrap();
+            match get_secret(&conn, name, &key, &iv) {
+                Ok(secret) => println!("{}", secret),
+                Err(e) => println!("Error retrieving secret: {:?}", e),
+            }
+        } else if let Some(_matches) = matches.subcommand_matches("export") { 
+            match export(&conn, &key, &iv) {
+                Ok(secrets) => println!("{}", serde_json::json!(secrets).to_string()),
+                Err(e) => println!("Error retrieving secret: {:?}", e),
+            }
+        } else if let Some(matches) = matches.subcommand_matches("import") { 
+            let data = matches.value_of("data").unwrap();
+            match import(&conn, data, &key, &iv) {
+                Ok(secrets) => println!("{}", serde_json::json!(secrets).to_string()),
+                Err(e) => println!("Error retrieving secret: {:?}", e),
+            }
         }
     }
     Ok(())
