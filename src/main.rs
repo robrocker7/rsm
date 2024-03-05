@@ -1,8 +1,6 @@
 use serde_json::Value;
 use std::env;
 use rusqlite::{params, Connection, Result};
-use crypto::{aes, blockmodes, buffer, symmetriccipher};
-use buffer::{BufferResult, ReadBuffer, WriteBuffer};
 use std::error::Error;
 use clap::{App, Arg, SubCommand};
 use std::fs::{self, OpenOptions};
@@ -10,57 +8,25 @@ use std::io::{Read, Write};
 use rand::{Rng};
 
 
+use aes::{Aes256, NewBlockCipher};
+use block_modes::{BlockMode, Cbc};
+use block_modes::block_padding::Pkcs7;
+
+
+
+type Aes256Cbc = Cbc<Aes256, Pkcs7>;
+
 // Encrypt function
-fn encrypt(data: &str, key: &[u8], iv: &[u8]) -> Result<Vec<u8>, symmetriccipher::SymmetricCipherError> {
-    let mut encryptor = aes::cbc_encryptor(
-        aes::KeySize::KeySize256,
-        key,
-        iv,
-        blockmodes::PkcsPadding);
-
-    let data_bytes = data.as_bytes();
-    let mut final_result = Vec::<u8>::new();
-    let mut read_buffer = buffer::RefReadBuffer::new(data_bytes);
-    let mut buffer = [0; 4096];
-    let mut write_buffer = buffer::RefWriteBuffer::new(&mut buffer);
-
-    loop {
-        let result = encryptor.encrypt(&mut read_buffer, &mut write_buffer, true)?;
-        final_result.extend(write_buffer.take_read_buffer().take_remaining().iter().copied());
-        match result {
-            BufferResult::BufferUnderflow => break,
-            BufferResult::BufferOverflow => { }
-        }
-    }
-
-    Ok(final_result)
+fn encrypt(data: &str, key: &[u8], iv: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let cipher = Aes256Cbc::new_from_slices(key, iv).map_err(|e| e.to_string())?;
+    Ok(cipher.encrypt_vec(data.as_bytes()))
 }
 
 // Decrypt function
-fn decrypt(encrypted_data: &[u8], key: &[u8], iv: &[u8]) -> Result<String, symmetriccipher::SymmetricCipherError> {
-    let mut decryptor = aes::cbc_decryptor(
-        aes::KeySize::KeySize256,
-        key,
-        iv,
-        blockmodes::PkcsPadding);
-
-    let mut final_result = Vec::<u8>::new();
-    let mut read_buffer = buffer::RefReadBuffer::new(encrypted_data);
-    let mut buffer = [0; 4096];
-    let mut write_buffer = buffer::RefWriteBuffer::new(&mut buffer);
-
-    loop {
-        let result = decryptor.decrypt(&mut read_buffer, &mut write_buffer, true)?;
-        final_result.extend(write_buffer.take_read_buffer().take_remaining().iter().copied());
-        match result {
-            BufferResult::BufferUnderflow => break,
-            BufferResult::BufferOverflow => { }
-        }
-    }
-
-    let decrypted_data_string = String::from_utf8(final_result)
-    .map_err(|_| symmetriccipher::SymmetricCipherError::InvalidLength)?;
-    Ok(decrypted_data_string)
+fn decrypt(encrypted_data: &[u8], key: &[u8], iv: &[u8]) -> Result<String, Box<dyn std::error::Error>> {
+    let cipher = Aes256Cbc::new_from_slices(key, iv).map_err(|e| e.to_string())?;
+    let decrypted_data = cipher.decrypt_vec(encrypted_data).map_err(|e| e.to_string())?;
+    Ok(String::from_utf8(decrypted_data)?)
 }
 
 // Store a secret
@@ -117,6 +83,7 @@ fn export(conn: &Connection, key: &[u8], iv: &[u8]) -> Result<Vec<Value>> {
 // Imports a list of secrets from the format the export uses
 fn import(conn: &Connection, secrest_json_string: &str, key: &[u8], iv: &[u8]) -> Result<Vec<Value>> {
     let mut responses = Vec::new();
+    println!("{:?}", secrest_json_string);
     let json: serde_json::Value = serde_json::from_str(&secrest_json_string).expect("JSON was not well-formatted");
     if let Some(secrets) = json.as_array() {
         for secret in secrets {
