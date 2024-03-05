@@ -7,8 +7,7 @@ use std::error::Error;
 use clap::{App, Arg, SubCommand};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
-use std::process::Command;
-use rand::{distributions::Alphanumeric, Rng};
+use rand::{Rng};
 
 
 // Encrypt function

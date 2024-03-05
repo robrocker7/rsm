@@ -6,12 +6,13 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-rust-crypto = "0.2"
+rust-crypto = "0.2.36"
 serde = "1.0"
 serde_json = "1.0"
 clap = "3.0"
 zerocopy = "0.7.31"
 rand = "0.8.4"
+time="0.2.23"
 
 [dependencies.rusqlite]
 version = "0.30.0"
