@@ -5,6 +5,11 @@ use crypto::{aes, blockmodes, buffer, symmetriccipher};
 use buffer::{BufferResult, ReadBuffer, WriteBuffer};
 use std::error::Error;
 use clap::{App, Arg, SubCommand};
+use std::fs::{self, OpenOptions};
+use std::io::{Read, Write};
+use std::process::Command;
+use rand::{distributions::Alphanumeric, Rng};
+
 
 // Encrypt function
 fn encrypt(data: &str, key: &[u8], iv: &[u8]) -> Result<Vec<u8>, symmetriccipher::SymmetricCipherError> {
@@ -139,13 +144,71 @@ fn import(conn: &Connection, secrest_json_string: &str, key: &[u8], iv: &[u8]) -
     Ok(responses)
 }
 
+fn get_or_create_env_var(var_name: &str) -> String {
+    match env::var(var_name) {
+        Ok(value) => value,
+        Err(_) => {
+            let bitsize = if var_name == "RSM_KEY" { 32 } else { 16 };
+            let rand_string: String = rand::thread_rng()
+                .sample_iter(&rand::distributions::Alphanumeric)
+                .take(bitsize)
+                .map(char::from)
+                .collect();
+            
+            set_env_var_permanently(var_name, &rand_string).expect("Failed to set environment variable permanently");
+            rand_string
+        },
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn set_env_var_permanently(var_name: &str, value: &str) -> Result<(), std::io::Error> {
+    // Not Tested yet
+    Command::new("setx")
+        .arg(var_name)
+        .arg(value)
+        .output()?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn set_env_var_permanently(var_name: &str, value: &str) -> Result<(), std::io::Error> {
+    let home_dir = env::var("HOME").map_err(|_| std::io::Error::new(std::io::ErrorKind::NotFound, "HOME variable not found"))?;
+    println!("{}", home_dir);
+    let profile_path = format!("{}/.bashrc", home_dir);
+    println!("{}", profile_path);
+
+    let mut current_contents = String::new();
+    if fs::metadata(&profile_path).is_ok() {
+        fs::File::open(&profile_path)
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::NotFound, "Failed to open profile file"))?
+            .read_to_string(&mut current_contents)
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::NotFound, "Failed to read profile file"))?;
+    }
+
+    // Check if the variable assignment already exists
+    if current_contents.contains(&format!("export {}=", var_name)) {
+        return Err(std::io::Error::new(std::io::ErrorKind::NotFound,
+            format!("{} is already defined in {}. Please launch the script in a new terminal session after ensuring {} is not already set or manually remove the existing entry.",
+                var_name, profile_path.to_string(), var_name)));
+    }
+
+    let mut file = OpenOptions::new()
+        .write(true)
+        .append(true)
+        .open(profile_path)?;
+    writeln!(file, "export {}={}", var_name, value)?;
+    Ok(())
+}
+
+
 fn main() -> Result<(), Box<dyn Error>> {
-    let key = env::var("RSM_KEY").unwrap().into_bytes();
-    let iv = env::var("RSM_IV").unwrap().into_bytes();
+    let key = get_or_create_env_var("RSM_KEY").into_bytes();
+    let iv = get_or_create_env_var("RSM_IV").into_bytes();
 
     let matches = App::new("Secrets Manager")
-        .version("1.0")
-        .author("Your Name")
+        .version("1.1")
+        .author("Robert Johnson")
         .about("Manages secrets")
         .subcommand(SubCommand::with_name("put")
             .about("Stores a secret")
@@ -172,6 +235,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 .required(true)
                 .index(1)))
         .get_matches();
+
     let mut path = env::current_exe()?;
     path.pop();
     path.push("secrets.db");
