@@ -1,8 +1,9 @@
 use serde_json::Value;
 use std::env;
+use std::path::PathBuf;
 use rusqlite::{params, Connection, Result};
 use std::error::Error;
-use clap::{App, Arg, SubCommand};
+use clap::{App, Arg, ArgMatches, SubCommand};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use rand::{Rng};
@@ -60,11 +61,19 @@ fn export(conn: &Connection, key: &[u8], iv: &[u8]) -> Result<Vec<Value>> {
     let rows = stmt.query_map([], |row| {
         let name: String = row.get(0)?;
         let data: Vec<u8> = row.get(1)?;
+        let decrypted_data = match decrypt(&data, key, iv) {
+            Ok(value) => value,
+            Err(_) => {
+                return Ok(serde_json::json!({
+                    "name": name,
+                    "error": "failed to decrypt",
+                }));
+            }
+        };
         let mut secret_json = serde_json::json!({
             "name": name,
             "data": "",
         });
-        let decrypted_data = decrypt(&data, key, iv).expect("Failed to decrypt");
         if serde_json::from_str::<serde_json::Value>(&decrypted_data).is_ok() {
             let json_data: Value = serde_json::from_str(&decrypted_data).unwrap();
             secret_json["data"] = json_data;
@@ -110,21 +119,118 @@ fn import(conn: &Connection, secrest_json_string: &str, key: &[u8], iv: &[u8]) -
     Ok(responses)
 }
 
+fn random_alphanumeric(len: usize) -> String {
+    rand::thread_rng()
+        .sample_iter(&rand::distributions::Alphanumeric)
+        .take(len)
+        .map(char::from)
+        .collect()
+}
+
 fn get_or_create_env_var(var_name: &str) -> String {
     match env::var(var_name) {
         Ok(value) => value,
         Err(_) => {
             let bitsize = if var_name == "RSM_KEY" { 32 } else { 16 };
-            let rand_string: String = rand::thread_rng()
-                .sample_iter(&rand::distributions::Alphanumeric)
-                .take(bitsize)
-                .map(char::from)
-                .collect();
-            
+            let rand_string = random_alphanumeric(bitsize);
             set_env_var_permanently(var_name, &rand_string).expect("Failed to set environment variable permanently");
             rand_string
         },
     }
+}
+
+fn configured_db_path(matches: &ArgMatches) -> Option<&str> {
+    if let Some((_, sub_matches)) = matches.subcommand() {
+        if let Some(path) = sub_matches.value_of("db") {
+            return Some(path);
+        }
+    }
+    matches.value_of("db")
+}
+
+fn resolve_db_path(matches: &ArgMatches) -> Result<PathBuf, Box<dyn Error>> {
+    if let Some(path) = configured_db_path(matches) {
+        Ok(PathBuf::from(path))
+    } else {
+        let mut path = env::current_exe()?;
+        path.pop();
+        path.push("secrets.db");
+        Ok(path)
+    }
+}
+
+fn ensure_secrets_table(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS secrets (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL UNIQUE,
+            data BLOB NOT NULL
+        )",
+        [],
+    )?;
+    Ok(())
+}
+
+fn load_secret(conn: &Connection, secret_name: &str, key: &[u8], iv: &[u8]) -> Result<String, Box<dyn Error>> {
+    let mut stmt = conn.prepare("SELECT data FROM secrets WHERE name = ?1")?;
+    let mut rows = stmt.query(params![secret_name])?;
+
+    if let Some(row) = rows.next()? {
+        let encrypted_data: Vec<u8> = row.get(0)?;
+        decrypt(&encrypted_data, key, iv)
+            .map_err(|err| format!("failed to decrypt {secret_name}: {err}").into())
+    } else {
+        Err(format!("secret not found: {secret_name}").into())
+    }
+}
+
+fn parse_secret_names(names: &str) -> Vec<String> {
+    names
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn share(conn: &Connection, filename: &str, names: &[String], key: &[u8], iv: &[u8]) -> Result<Value, Box<dyn Error>> {
+    if names.is_empty() {
+        return Err("no secret names provided".into());
+    }
+
+    let mut payloads = Vec::with_capacity(names.len());
+    for name in names {
+        payloads.push((name.clone(), load_secret(conn, name, key, iv)?));
+    }
+
+    let dest = PathBuf::from(filename);
+    if dest.exists() {
+        return Err(format!("database already exists: {}", dest.display()).into());
+    }
+
+    let new_key = random_alphanumeric(32);
+    let new_iv = random_alphanumeric(16);
+
+    let write_result: Result<(), Box<dyn Error>> = (|| {
+        let dest_conn = Connection::open(&dest)?;
+        ensure_secrets_table(&dest_conn)?;
+        for (name, plain) in &payloads {
+            put_secret(&dest_conn, name, plain, new_key.as_bytes(), new_iv.as_bytes())?;
+        }
+        Ok(())
+    })();
+
+    if let Err(err) = write_result {
+        let _ = fs::remove_file(&dest);
+        return Err(err);
+    }
+
+    Ok(serde_json::json!({
+        "filename": filename,
+        "RSM_KEY": new_key,
+        "RSM_IV": new_iv,
+        "secrets": names,
+    }))
 }
 
 #[cfg(target_os = "windows")]
@@ -176,6 +282,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         .version("1.1")
         .author("Robert Johnson")
         .about("Manages secrets")
+        .arg(Arg::with_name("db")
+            .long("db")
+            .env("RSM_DB")
+            .global(true)
+            .takes_value(true)
+            .help("SQLite database path (default: secrets.db next to the rsm binary)"))
         .subcommand(SubCommand::with_name("put")
             .about("Stores a secret")
             .arg(Arg::with_name("name")
@@ -200,23 +312,22 @@ fn main() -> Result<(), Box<dyn Error>> {
                 .help("The json data of the secrets")
                 .required(true)
                 .index(1)))
+        .subcommand(SubCommand::with_name("share")
+            .about("Export selected secrets into a new database with new encryption keys")
+            .arg(Arg::with_name("filename")
+                .help("Path of the new database to create")
+                .required(true)
+                .index(1))
+            .arg(Arg::with_name("names")
+                .help("Comma-separated secret names to copy")
+                .required(true)
+                .index(2)))
         .get_matches();
 
-    let mut path = env::current_exe()?;
-    path.pop();
-    path.push("secrets.db");
+    let path = resolve_db_path(&matches)?;
     {
         let conn = Connection::open(path)?;
-
-        // Create the table for storing secrets
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS secrets (
-                id INTEGER PRIMARY KEY,
-                name TEXT NOT NULL UNIQUE,
-                data BLOB NOT NULL
-            )",
-            [],
-        )?;
+        ensure_secrets_table(&conn)?;
 
         if let Some(matches) = matches.subcommand_matches("put") {
             let name = matches.value_of("name").unwrap();
@@ -240,6 +351,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                 Ok(secrets) => println!("{}", serde_json::json!(secrets).to_string()),
                 Err(e) => println!("Error retrieving secret: {:?}", e),
             }
+        } else if let Some(share_matches) = matches.subcommand_matches("share") {
+            let filename = share_matches.value_of("filename").unwrap();
+            let names = parse_secret_names(share_matches.value_of("names").unwrap());
+            let result = share(&conn, filename, &names, &key, &iv)?;
+            println!("{}", result);
         }
     }
     Ok(())
