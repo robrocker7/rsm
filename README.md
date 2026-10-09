@@ -22,6 +22,14 @@ The `RMS_KEY` and `RMS_IV` environment variables are required to be set.
 
 `export RMS_KEY="1234567890ABCDEF"`
 
+### RSM_DB
+
+Optional path to the SQLite database. When it is unset, rsm uses `secrets.db` next to the executable. The `--db` flag overrides this variable.
+
+`export RSM_DB="/path/to/secrets.db"`
+
+`rsm --db /path/to/secrets.db get awslocal`
+
 ## Example Usage
 
 ### Put a Secret
@@ -38,6 +46,18 @@ Response
 Response:
 `{"aws_access_key_id":"SuperSecretValue","aws_access_secret_key":"SuperSecretValue"}`
 
+### Share secrets
+
+Copy named secrets into a new database encrypted with new keys. The current `RSM_KEY` and `RSM_IV` stay unchanged.
+
+`rsm share shared.db slack,openai`
+
+Response:
+`{"filename":"shared.db","RSM_KEY":"...","RSM_IV":"...","secrets":["slack","openai"]}`
+
+Read from the new database with the printed keys:
+
+`RSM_KEY="..." RSM_IV="..." rsm --db shared.db get slack`
 
 ### Simple Rust Subprocess Example
 
